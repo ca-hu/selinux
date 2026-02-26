@@ -18,12 +18,14 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <stdint.h>
+#include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/xattr.h>
 #include <sys/vfs.h>
 #include <sys/statvfs.h>
 #include <sys/utsname.h>
+#include <linux/btrfs.h>
 #include <linux/magic.h>
 #include <libgen.h>
 #include <syslog.h>
@@ -911,6 +913,10 @@ static void *selinux_restorecon_thread(void *arg)
 	struct stat ent_st;
 	bool first = false;
 
+	struct statfs fs_info;
+	uint64_t btrfs_subvol_flags;
+	int btrfs_check_ret;
+
 	if (state->parallel)
 		pthread_mutex_lock(&state->mutex);
 
@@ -1014,6 +1020,36 @@ loop_body:
 				state->error = -1;
 				state->abort = true;
 				goto finish;
+			}
+
+			/* If it is a btrfs readonly mount, skip relabel
+			   but continue traversal in case there is a rw mount
+			   beneath it */
+			if (ftsent->fts_statp->st_dev != state->dev_num &&
+			    statfs(ftsent->fts_path, &fs_info) == 0 &&
+			    fs_info.f_type == BTRFS_SUPER_MAGIC &&
+			    ftsent->fts_statp->st_ino == 256) {
+				int fd = open(ftsent->fts_path, O_RDONLY);
+				if (fd < 0) {
+					selinux_log(SELINUX_ERROR,
+						    "RO BTRFS check: Could not open file descriptor for %s\n",
+						    ftsent->fts_path);
+					continue;
+				}
+				btrfs_check_ret = ioctl(fd, BTRFS_IOC_SUBVOL_GETFLAGS, &btrfs_subvol_flags);
+				close(fd);
+				if (btrfs_check_ret < 0) {
+				        selinux_log(SELINUX_ERROR,
+						    "RO BTRFS check: ioctl failed for %s\n",
+						    ftsent->fts_path);
+					continue;
+				}
+				if (btrfs_subvol_flags == BTRFS_SUBVOL_RDONLY) {
+					selinux_log(SELINUX_INFO,
+						    "Read-only btrfs subvolume mount, skip relabel but traversing further down: %s\n",
+						    ftsent->fts_path);
+					continue;
+				}
 			}
 
 			ent_st = *ftsent->fts_statp;
