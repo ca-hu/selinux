@@ -7,6 +7,10 @@
 #include <stddef.h>
 #include <stdarg.h>
 
+#ifndef BTRFS_IOC_SUBVOL_GETFLAGS
+#define BTRFS_IOC_SUBVOL_GETFLAGS _IOR(BTRFS_IOCTL_MAGIC, 25, __u64)
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif

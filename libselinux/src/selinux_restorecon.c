@@ -18,12 +18,14 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <stdint.h>
+#include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/xattr.h>
 #include <sys/vfs.h>
 #include <sys/statvfs.h>
 #include <sys/utsname.h>
+#include <linux/btrfs.h>
 #include <linux/magic.h>
 #include <libgen.h>
 #include <syslog.h>
@@ -882,6 +884,43 @@ oom:
 	goto free;
 }
 
+/*
+ * Check if a path is a readonly btrfs subvolume root.
+ * Returns true if the path is a btrfs subvolume (inode 256) and is readonly.
+ */
+static bool is_readonly_btrfs_subvol(const char *path)
+{
+	struct statfs fs_info;
+	struct stat st;
+	uint64_t btrfs_subvol_flags;
+	int fd;
+
+	if (lstat(path, &st) < 0)
+		return false;
+
+	/* Check if it's a btrfs subvolume root (inode 256) */
+	if (st.st_ino != 256)
+		return false;
+
+	if (statfs(path, &fs_info) < 0)
+		return false;
+
+	if (fs_info.f_type != BTRFS_SUPER_MAGIC)
+		return false;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return false;
+
+	if (ioctl(fd, BTRFS_IOC_SUBVOL_GETFLAGS, &btrfs_subvol_flags) < 0) {
+		close(fd);
+		return false;
+	}
+
+	close(fd);
+	return (btrfs_subvol_flags & BTRFS_SUBVOL_RDONLY) != 0;
+}
+
 struct rest_state {
 	struct rest_flags flags;
 	dev_t dev_num;
@@ -910,6 +949,10 @@ static void *selinux_restorecon_thread(void *arg)
 	char ent_path[PATH_MAX];
 	struct stat ent_st;
 	bool first = false;
+
+	/* Track current btrfs subvolume readonly status */
+	dev_t current_btrfs_dev = 0;
+	bool current_btrfs_ro = false;
 
 	if (state->parallel)
 		pthread_mutex_lock(&state->mutex);
@@ -1014,6 +1057,26 @@ loop_body:
 				state->error = -1;
 				state->abort = true;
 				goto finish;
+			}
+
+			/* When we cross to a different device on btrfs, check if it's a
+			 * readonly subvolume. Cache this to avoid repeated checks.
+			 * This allows rw subvolumes within ro subvolumes to be relabeled.
+			 */
+			if (state->sfsb.f_type == BTRFS_SUPER_MAGIC &&
+			    ftsent->fts_statp->st_dev != state->dev_num) {
+				/* New device - check if it's a readonly btrfs subvolume */
+				if (ftsent->fts_statp->st_dev != current_btrfs_dev) {
+					current_btrfs_dev = ftsent->fts_statp->st_dev;
+					current_btrfs_ro = is_readonly_btrfs_subvol(ftsent->fts_path);
+				}
+
+				if (current_btrfs_ro) {
+					selinux_log(SELINUX_INFO,
+						    "File in read-only btrfs subvolume, skipping: %s\n",
+						    ftsent->fts_path);
+					continue;
+				}
 			}
 
 			ent_st = *ftsent->fts_statp;
