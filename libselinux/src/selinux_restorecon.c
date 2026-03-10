@@ -884,6 +884,43 @@ oom:
 	goto free;
 }
 
+/*
+ * Check if a path is a readonly btrfs subvolume root.
+ * Returns true if the path is a btrfs subvolume (inode 256) and is readonly.
+ */
+static bool is_readonly_btrfs_subvol(const char *path)
+{
+	struct statfs fs_info;
+	struct stat st;
+	uint64_t btrfs_subvol_flags;
+	int fd;
+
+	if (lstat(path, &st) < 0)
+		return false;
+
+	/* Check if it's a btrfs subvolume root (inode 256) */
+	if (st.st_ino != 256)
+		return false;
+
+	if (statfs(path, &fs_info) < 0)
+		return false;
+
+	if (fs_info.f_type != BTRFS_SUPER_MAGIC)
+		return false;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return false;
+
+	if (ioctl(fd, BTRFS_IOC_SUBVOL_GETFLAGS, &btrfs_subvol_flags) < 0) {
+		close(fd);
+		return false;
+	}
+
+	close(fd);
+	return (btrfs_subvol_flags & BTRFS_SUBVOL_RDONLY) != 0;
+}
+
 struct rest_state {
 	struct rest_flags flags;
 	dev_t dev_num;
@@ -901,6 +938,10 @@ struct rest_state {
 	long unsigned relabeled_files;
 	int saved_errno;
 	pthread_mutex_t mutex;
+
+	/* Track current btrfs subvolume readonly status */
+	dev_t current_btrfs_dev;
+	bool current_btrfs_ro;
 };
 
 static void *selinux_restorecon_thread(void *arg)
@@ -912,10 +953,6 @@ static void *selinux_restorecon_thread(void *arg)
 	char ent_path[PATH_MAX];
 	struct stat ent_st;
 	bool first = false;
-
-	struct statfs fs_info;
-	uint64_t btrfs_subvol_flags;
-	int btrfs_check_ret;
 
 	if (state->parallel)
 		pthread_mutex_lock(&state->mutex);
@@ -1022,31 +1059,21 @@ loop_body:
 				goto finish;
 			}
 
-			/* If it is a btrfs readonly mount, skip relabel
-			   but continue traversal in case there is a rw mount
-			   beneath it */
-			if (ftsent->fts_statp->st_dev != state->dev_num &&
-			    statfs(ftsent->fts_path, &fs_info) == 0 &&
-			    fs_info.f_type == BTRFS_SUPER_MAGIC &&
-			    ftsent->fts_statp->st_ino == 256) {
-				int fd = open(ftsent->fts_path, O_RDONLY);
-				if (fd < 0) {
-					selinux_log(SELINUX_ERROR,
-						    "RO BTRFS check: Could not open file descriptor for %s\n",
-						    ftsent->fts_path);
-					continue;
+			/* When we cross to a different device on btrfs, check if it's a
+			 * readonly subvolume. Cache this to avoid repeated checks.
+			 * This allows rw subvolumes within ro subvolumes to be relabeled.
+			 */
+			if (state->sfsb.f_type == BTRFS_SUPER_MAGIC &&
+			    ftsent->fts_statp->st_dev != state->dev_num) {
+				/* New device - check if it's a readonly btrfs subvolume */
+				if (ftsent->fts_statp->st_dev != state->current_btrfs_dev) {
+					state->current_btrfs_dev = ftsent->fts_statp->st_dev;
+					state->current_btrfs_ro = is_readonly_btrfs_subvol(ftsent->fts_path);
 				}
-				btrfs_check_ret = ioctl(fd, BTRFS_IOC_SUBVOL_GETFLAGS, &btrfs_subvol_flags);
-				close(fd);
-				if (btrfs_check_ret < 0) {
-				        selinux_log(SELINUX_ERROR,
-						    "RO BTRFS check: ioctl failed for %s\n",
-						    ftsent->fts_path);
-					continue;
-				}
-				if (btrfs_subvol_flags == BTRFS_SUBVOL_RDONLY) {
+
+				if (state->current_btrfs_ro) {
 					selinux_log(SELINUX_INFO,
-						    "Read-only btrfs subvolume mount, skip relabel but traversing further down: %s\n",
+						    "File in read-only btrfs subvolume, skipping: %s\n",
 						    ftsent->fts_path);
 					continue;
 				}
@@ -1147,6 +1174,8 @@ static int selinux_restorecon_common(const char *pathname_orig,
 	state.skipped_errors = 0;
 	state.relabeled_files = 0;
 	state.saved_errno = 0;
+	state.current_btrfs_dev = 0;
+	state.current_btrfs_ro = false;
 
 	struct stat sb;
 	char *pathname = NULL, *pathdnamer = NULL, *pathdname, *pathbname;
