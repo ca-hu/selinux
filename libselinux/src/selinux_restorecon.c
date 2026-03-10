@@ -938,10 +938,6 @@ struct rest_state {
 	long unsigned relabeled_files;
 	int saved_errno;
 	pthread_mutex_t mutex;
-
-	/* Track current btrfs subvolume readonly status */
-	dev_t current_btrfs_dev;
-	bool current_btrfs_ro;
 };
 
 static void *selinux_restorecon_thread(void *arg)
@@ -953,6 +949,10 @@ static void *selinux_restorecon_thread(void *arg)
 	char ent_path[PATH_MAX];
 	struct stat ent_st;
 	bool first = false;
+
+	/* Track current btrfs subvolume readonly status */
+	dev_t current_btrfs_dev = 0;
+	bool current_btrfs_ro = false;
 
 	if (state->parallel)
 		pthread_mutex_lock(&state->mutex);
@@ -1066,12 +1066,12 @@ loop_body:
 			if (state->sfsb.f_type == BTRFS_SUPER_MAGIC &&
 			    ftsent->fts_statp->st_dev != state->dev_num) {
 				/* New device - check if it's a readonly btrfs subvolume */
-				if (ftsent->fts_statp->st_dev != state->current_btrfs_dev) {
-					state->current_btrfs_dev = ftsent->fts_statp->st_dev;
-					state->current_btrfs_ro = is_readonly_btrfs_subvol(ftsent->fts_path);
+				if (ftsent->fts_statp->st_dev != current_btrfs_dev) {
+					current_btrfs_dev = ftsent->fts_statp->st_dev;
+					current_btrfs_ro = is_readonly_btrfs_subvol(ftsent->fts_path);
 				}
 
-				if (state->current_btrfs_ro) {
+				if (current_btrfs_ro) {
 					selinux_log(SELINUX_INFO,
 						    "File in read-only btrfs subvolume, skipping: %s\n",
 						    ftsent->fts_path);
@@ -1174,8 +1174,6 @@ static int selinux_restorecon_common(const char *pathname_orig,
 	state.skipped_errors = 0;
 	state.relabeled_files = 0;
 	state.saved_errno = 0;
-	state.current_btrfs_dev = 0;
-	state.current_btrfs_ro = false;
 
 	struct stat sb;
 	char *pathname = NULL, *pathdnamer = NULL, *pathdname, *pathbname;
