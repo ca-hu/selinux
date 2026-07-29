@@ -3,11 +3,6 @@
 from setuptools import Extension, setup
 
 setup(
-    name="selinux",
-    version="3.11",
-    description="SELinux python 3 bindings",
-    author="SELinux Project",
-    author_email="selinux@vger.kernel.org",
     ext_modules=[
         Extension('selinux._selinux',
                   sources=['selinuxswig_python.i'],
