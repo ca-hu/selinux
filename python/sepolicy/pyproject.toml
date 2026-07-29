@@ -11,5 +11,9 @@ authors = [
     { name = "SELinux Project", email = "selinux@vger.kernel.org" }
 ]
 
-[project.scripts]
-sepolicy = "sepolicy.__main__:main"
+[tool.setuptools]
+packages = ["sepolicy", "sepolicy.templates", "sepolicy.help"]
+
+[tool.setuptools.package-data]
+sepolicy = ["*.glade"]
+"sepolicy.help" = ["*.txt", "*.png"]
